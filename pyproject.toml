@@ -1,0 +1,69 @@
+[project]
+name = "comment-pr-agent"
+version = "0.6.1"
+description = "Comment-driven pull request agent (LangGraph + GitHub App / GitHub Actions)"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langgraph-checkpoint>=2.0.0",
+    "groq>=1.5.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+    "pyjwt[crypto]>=2.8.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+postgres = ["langgraph-checkpoint-postgres>=2.0.0", "psycopg[binary]>=3.1.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0", "mypy>=1.11.0"]
+
+[project.scripts]
+comment-pr-agent = "agent.run:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agent", "agent.skills"]
+
+[tool.setuptools.package-data]
+agent = ["skills_builtin/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/test_apply_profile.py imports `scripts.apply_profile`, and `scripts` is
+# deliberately NOT a distributed package. Without this, the bare `pytest`
+# console script (what setup.sh runs) fails collection with
+# ModuleNotFoundError, while `python -m pytest` succeeds -- the two disagreeing
+# is exactly the sort of thing that makes a green suite untrustworthy.
+pythonpath = ["."]
+
+[tool.ruff]
+# 100, not 88. The codebase is written to ~100 and reflowing every line to
+# satisfy a default would be a large diff that changes no behaviour.
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/F  pycodestyle + pyflakes  -- real errors
+# I    import sorting          -- deterministic diffs
+# B    flake8-bugbear          -- caught a `pytest.raises(Exception)` that was
+#                                 masking an AttributeError in this repo's own
+#                                 test suite, which is the case for having it
+# UP is deliberately OFF: it wants `List` -> `list` and `Optional[X]` -> `X | None`
+# across every file. Safe under `from __future__ import annotations`, but it is a
+# whole-codebase cosmetic diff. Enable it on a quiet day, alone, in one commit.
+select = ["E", "F", "I", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# Not `strict`. The goal is catching invariants that are true but unprovable
+# locally -- e.g. `pr_number: int | None` reaching an `int` parameter because a
+# guarantee lives in another module. Full strictness on an existing codebase
+# produces noise that gets silenced rather than fixed.
+warn_unused_ignores = true

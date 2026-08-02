@@ -1,0 +1,218 @@
+# Actions-native deployment. Copy to .github/workflows/ in the TARGET repo.
+#
+# Comment `/agent <what you want>` on any issue or PR in that repo and this
+# runs. No CLI, no laptop, no webhook, no public endpoint.
+#
+# ---------------------------------------------------------------------------
+# BEFORE THIS WORKS, two things need setting:
+#
+#   1. AGENT_PACKAGE below must point at a real installable source. It ships
+#      pointing at a repo that does not exist yet -- run `bash publish-agent.sh`
+#      in the workspace to create it, or see GITHUB-ACTIONS.md.
+#   2. Add GROQ_API_KEY as a repository secret:
+#      Settings -> Secrets and variables -> Actions -> New repository secret.
+#
+# GITHUB_TOKEN needs no setup; Actions injects it.
+# ---------------------------------------------------------------------------
+#
+# Why this is the recommended deployment:
+#   - no public endpoint, so no webhook secret to leak or forget
+#   - GITHUB_TOKEN is scoped to this repo and expires with the job, instead of
+#     an App private key sitting on a host that runs repo-supplied commands
+#   - the runner is the ephemeral, isolated container the README asks for
+#   - `concurrency` below replaces hand-rolled branch locking
+#
+# Note: issue_comment workflows always run the copy on the DEFAULT branch, so a
+# pull request cannot modify the agent's own workflow. Changes here take effect
+# only after merging.
+name: comment-pr-agent
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # One run at a time for the WHOLE REPOSITORY, not per issue.
+  #
+  # Per-issue grouping solves the git race (two `/agent` comments on one PR, the
+  # second push a non-fast-forward). It does nothing about the other shared
+  # resource: LLM rate limits are enforced per ORGANISATION, so two PRs commented
+  # on at once means two runs draining one token-per-minute bucket, and both fail
+  # with 429s. On a free tier a single run already costs more than a minute's
+  # allowance, so serialising the repo is the honest setting.
+  #
+  # On a paid tier with headroom, `-${{ github.event.issue.number }}` is the
+  # faster choice.
+  group: comment-pr-agent-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # ---------------------------------------------------------------------------
+  # Where pip gets the agent from. CHANGE THIS.
+  #
+  # The agent is not on PyPI. Point it at your own copy -- a public repo is
+  # simplest; for a private one, add a PAT with `repo` scope as a secret and use
+  #   git+https://x-access-token:${{ secrets.AGENT_REPO_TOKEN }}@github.com/...
+  #
+  # Pin to a tag rather than @main once you stop changing it: a workflow that
+  # silently picks up new agent behaviour is hard to debug from a PR comment.
+  # ---------------------------------------------------------------------------
+  AGENT_PACKAGE: "comment-pr-agent @ git+https://github.com/YOUR-USERNAME/comment-pr-agent@v0.6.1"
+
+jobs:
+  agent:
+    # Gate BEFORE a runner starts. This workflow runs in the base repo with
+    # write permissions and access to secrets, triggered by a comment from
+    # anyone who can comment — so authorization matters more here, not less.
+    #
+    # This `if:` is the FIRST of two gates. The agent step below passes
+    # --enforce-authorization, which re-applies agent.commands.is_authorized and
+    # is_addressed in Python against the same association. Both must pass. That
+    # second layer is not decoration: this YAML gate and the bash trigger grep
+    # are separate implementations from the ones the webhook uses, and they had
+    # already drifted (the grep matches a trigger inside a fenced code block;
+    # is_addressed does not).
+    if: >-
+      github.event.comment.user.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+               github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check the trigger phrase
+        id: gate
+        env:
+          # Through env, never interpolated into a shell command: a comment
+          # body containing backticks or $(...) would otherwise execute here.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if printf '%s' "$COMMENT_BODY" | grep -qE '^[[:space:]]*/agent([[:space:]]|$)'; then
+            echo "addressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "addressed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Immediate feedback. Without this the reviewer stares at a comment with
+      # no reaction for a minute or more and assumes nothing happened.
+      - name: Acknowledge the comment
+        if: steps.gate.outputs.addressed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes --silent || true
+
+      - name: Resolve the PR head branch
+        if: steps.gate.outputs.addressed == 'true' && github.event.issue.pull_request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr view "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" \
+            --json headRefName,state \
+            --jq '"ref=" + .headRefName, "state=" + .state' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.gate.outputs.addressed == 'true'
+        with:
+          # Do not leave the token in the checkout. The agent passes it
+          # explicitly for the push instead.
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ steps.pr.outputs.ref || github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.addressed == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install the agent
+        if: steps.gate.outputs.addressed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "$AGENT_PACKAGE"
+
+      - name: Run the agent
+        if: steps.gate.outputs.addressed == 'true'
+        env:
+          AGENT_COMMENT: ${{ github.event.comment.body }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Dual-mode reasoning model: 131K context, 16,384 max output tokens.
+          # The output ceiling is the binding constraint, not the context window --
+          # see agent/config.py MODEL_LIMITS.
+          AGENT_MODEL: 'qwen/qwen3.6-27b'
+
+          # ---------------------------------------------------------------
+          # FREE-TIER TOKEN BUDGET. These mirror .env.free-tier, and without
+          # them this workflow cannot work on a free Groq key.
+          #
+          # Groq charges prompt + the max_completion_tokens you REQUEST against
+          # your TPM ceiling, used or not. The stock edit budget of 12,000 plus
+          # a ~2,100 prompt is ~14,100 against a free tier's 8,000 -- a request
+          # that can never be admitted, no matter how long the agent backs off.
+          # It is not slow, it is impossible.
+          #
+          # On a paid tier, delete this whole block: the defaults are better.
+          # ---------------------------------------------------------------
+          AGENT_REASONING_EFFORT: 'none'
+          AGENT_EDIT_REASONING_EFFORT: 'none'
+          AGENT_REASONING_FORMAT: 'hidden'
+          AGENT_INTERPRET_MAX_TOKENS: '800'
+          AGENT_PLAN_MAX_TOKENS: '1200'
+          AGENT_MAX_TOKENS: '3000'
+          AGENT_MAX_TARGET_FILES: '2'
+          AGENT_MAX_FILE_CHARS: '6000'
+          AGENT_MAX_DIFF_CHARS: '2000'
+          AGENT_MAX_RETRIES: '1'
+          AGENT_MAX_TRANSIENT_RETRIES: '6'
+
+          # Empty: this is what turns ON per-repo auto-detection, which finds
+          # requirements.txt / pyproject.toml / package.json / go.mod /
+          # Cargo.toml / Makefile and builds the validation command itself.
+          AGENT_VALIDATE_CMD: ''
+          AGENT_ISOLATED_VALIDATE: 'true'
+          AGENT_VALIDATE_SETUP_TIMEOUT: '300'
+          AGENT_VALIDATE_TIMEOUT: '900'
+          AGENT_SKIP_VALIDATION_IF_UNKNOWN: 'true'
+
+          # FALSE, deliberately -- this differs from what v0.6.0 shipped.
+          #
+          # `true` lets a repo skill's `validate_cmd` override detection. That
+          # sounds strictly better and is not: an override runs at the repo ROOT
+          # and OUTSIDE the isolated venv, so a skill saying
+          #   python -m pip install -r x/requirements.txt && python -m pytest -q
+          # dies on a fresh runner with `No module named pytest` -- setup-python
+          # does not preinstall it and that command never installs it.
+          # Detection installs pytest itself and runs in the directory holding
+          # the manifest. Set this to `true` only for a skill command you have
+          # actually run on a clean machine.
+          AGENT_ALLOW_REPO_VALIDATE_CMD: 'false'
+          # Defence in depth. agent.config no longer searches upward from the
+          # cwd for a .env -- which here is the checked-out TARGET repo, so a
+          # committed .env could otherwise redirect GROQ_BASE_URL or
+          # GITHUB_API_BASE to a host that then receives our Authorization
+          # header. This makes the intent explicit at the call site too.
+          AGENT_NO_DOTENV: 'true'
+        run: |
+          # The console script, NOT `python -m agent.run`: the working
+          # directory is the target repository, and `python -m` puts the cwd
+          # first on sys.path, so a repo containing its own top-level `agent/`
+          # package would shadow ours and run its code instead.
+          comment-pr-agent \
+            --repo "${{ github.repository }}" \
+            --issue "${{ github.event.issue.number }}" \
+            ${{ github.event.issue.pull_request && format('--pr {0}', github.event.issue.number) || '' }} \
+            --comment-from-env \
+            --author "${{ github.event.comment.user.login }}" \
+            --author-association "${{ github.event.comment.author_association }}" \
+            --enforce-authorization \
+            --workspace "$GITHUB_WORKSPACE"
